@@ -554,7 +554,15 @@ list_cards() { # path<TAB>size<TAB>description, removable disks not in use by th
 	for d in json.loads(out or '{"blockdevices": []}')['blockdevices']:
 	    if d.get('type') != 'disk':
 	        continue
-	    removable = yes(d.get('rm')) or yes(d.get('hotplug')) or d.get('tran') == 'usb' or d['path'].startswith('/dev/mmcblk')
+	    if d['path'].startswith('/dev/mmcblk'):
+	        # built-in SD readers show up as mmcblk, but so does a PC's own eMMC:
+	        # only an SD card qualifies
+	        try:
+	            removable = open(f"/sys/block/{d['path'][5:]}/device/type").read().strip() == 'SD'
+	        except OSError:
+	            removable = False
+	    else:
+	        removable = yes(d.get('rm')) or yes(d.get('hotplug')) or d.get('tran') == 'usb'
 	    size = int(d.get('size') or 0)
 	    if not removable or not 1.5e9 <= size <= 512e9:
 	        continue
@@ -908,6 +916,21 @@ cmd_restore() {
 		got=$(bsudo sd "sha256sum $dev" | cut -c1-64)
 		[ "$want" = "$got" ] && ok "$name restored and verified" || die "$name doesn't verify after writing"
 	done
+	# the install switches boot-from-boot-partition off; put back what the
+	# backup recorded (PARTITION_CONFIG, EXT_CSD byte 179)
+	local pc bpe ack
+	pc=$(cut -c359-360 "$dir/ext_csd.txt" 2>/dev/null)
+	if [[ $pc =~ ^[0-9a-fA-F]{2}$ ]]; then
+		bpe=$(( (0x$pc >> 3) & 7 )) ack=$(( (0x$pc >> 6) & 1 ))
+		case $bpe in 1 | 2)
+			say "  the eMMC booted from its boot partition $bpe when it was backed up; switching that back on"
+			bsudo sd "sh -c 'command -v mmc >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q mmc-utils >/dev/null; mmc bootpart enable $bpe $ack $emmc'" ||
+				die "couldn't switch boot partition $bpe back on (on the box: sudo mmc bootpart enable $bpe $ack $emmc)"
+			ok "boot partition $bpe enabled again, as shipped" ;;
+		esac
+	else
+		warn "no EXT_CSD in the backup: boot partition setting left as it is"
+	fi
 	ok "Android is back. Power off, remove the SD card, power on."
 }
 

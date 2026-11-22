@@ -115,6 +115,11 @@ carries on where it stopped (`./t95-setup status` shows where that is).
 `./t95-setup restore` puts the backed-up Android back. Private files (password
 hash, the box's SSH host keys, reports) live in `.t95-setup/`, git-ignored.
 
+The card `t95-setup` writes is **yours only**: `out/t95-sd.img` from a
+`t95-setup` build holds the box's private SSH host keys, your password hash and
+your SSH key. Don't share it. An image to share comes from the plain `board/`
+scripts in [Building](#building).
+
 ## Building
 
 Everything builds as a normal user on an x86-64 Linux PC (tested on Linux Mint
