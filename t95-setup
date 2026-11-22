@@ -1,0 +1,969 @@
+#!/usr/bin/env bash
+# t95-setup: guided, resumable install of mainline Debian on a T95 (H616) box.
+#
+# Runs on your Linux PC, from this repo, and drives the scripts in board/. It
+# does everything it can by itself and only stops for what needs your hands
+# (SD card, cables, power) or your OK (anything that erases something).
+#
+#   ./t95-setup                run every step that isn't done yet (resumes)
+#   ./t95-setup status         show progress
+#   ./t95-setup STEP...        (re)run particular steps
+#   ./t95-setup restore [DIR]  put the backed-up Android back on the eMMC
+#   ./t95-setup reset          forget progress (keeps keys, password, backups)
+#
+# Steps, in order:
+#   prep     check this PC, install build packages, fetch sources + Debian keys
+#   doctor   read-only check of the box from Android over adb: right board?
+#   build    U-Boot, DTB, Debian rootfs and SD image (~30-40 min, online)
+#   card     write the SD card (you confirm the card by typing its name)
+#   boot     you boot the box from the card; it's found by its SSH host key
+#   check    health checks over SSH: RAM, CPU, thermal, eMMC, kernel log...
+#   backup   full, hash-verified backup of the eMMC (Android as shipped)
+#   install  erase the eMMC and install Debian on it (you type 'wipe')
+#   verify   you power-cycle without the card; checks it runs from the eMMC
+#
+# Options:
+#   --dry-run       show what would happen; touches nothing
+#   --host IP       the box's address (skips the network scan)
+#   --adb TARGET    adb serial, or the box's IP for network adb (doctor)
+#   --force         go on past failed checks (never past 'wipe')
+#
+# Private files live in .t95-setup/ (git-ignored): the password hash, the
+# box's SSH host keys, known_hosts, reports. A transcript goes to logs/.
+# shellcheck disable=SC2015,SC2016,SC2029  # a && ok || warn; remote commands in single quotes
+set -uo pipefail
+
+W=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+ST=$W/.t95-setup
+PHASES=(prep doctor build card boot check backup install verify)
+
+# pinned sources (keep in step with README.md)
+UBOOT_TAG=v2026.10
+TFA_TAG=v2.15.0
+LINUX_TAG=v6.12
+# Debian 13/trixie archive + security archive signing keys, as published on
+# https://ftp-master.debian.org/keys.html (checked there again at download)
+TRIXIE_FPRS=(04B54C3CDCA79751B16BC6B5225629DF75B188BD 5E04A1E3223A19A20706E20F9904613D4CCE68C6)
+KEY_URLS=(https://ftp-master.debian.org/keys/archive-key-13.asc
+	https://ftp-master.debian.org/keys/archive-key-13-security.asc)
+KEYRING=$W/keys/debian-keyring/x/usr/share/keyrings/debian-archive-keyring.pgp
+
+BOXUSER=${T95_USER:-t95}
+PORT=${T95_SSH_PORT:-22}
+DRY=0 FORCE=0 HOST_OPT='' ADB_TARGET=''
+BOXPW=          # the box password, in memory for this run only
+REPORT=         # when set, result lines are also appended here
+FOUND_IP='' FOUND_AS=''
+
+# ---------------------------------------------------------------- output
+if [ -t 1 ]; then B=$'\e[1m' RED=$'\e[31m' GRN=$'\e[32m' YEL=$'\e[33m' CYN=$'\e[36m' N=$'\e[0m'
+else B='' RED='' GRN='' YEL='' CYN='' N=''; fi
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n%s== %s%s\n' "$B$CYN" "$*" "$N"; }
+_res() { printf '  %s%-5s%s %s\n' "$1" "$2" "$N" "$3"; [ -z "$REPORT" ] || printf '%-5s %s\n' "$2" "$3" >> "$REPORT"; }
+ok()   { _res "$GRN" ok "$*"; }
+warn() { _res "$YEL" warn "$*"; }
+bad()  { _res "$RED" FAIL "$*"; }
+info() { _res "$CYN" info "$*"; }
+die()  { printf '\n%st95-setup: %s%s\n' "$RED" "$*" "$N" >&2; exit 1; }
+run()  { if [ "$DRY" = 1 ]; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi; }
+
+# asks on the terminal; returns 0 only if the answer is exactly $2 (default yes)
+ask_yes() {
+	local word=${2:-yes} ans
+	if [ "$DRY" = 1 ]; then say "  [dry-run] would ask: $1 (type '$word')"; return 0; fi
+	printf '\n  %s%s%s\n' "$B" "$1" "$N"
+	read -r -p "  Type '$word' to continue, anything else to stop: " ans </dev/tty || return 1
+	[ "$ans" = "$word" ]
+}
+# a physical step: show it, wait for Enter
+pause() {
+	if [ "$DRY" = 1 ]; then say "  [dry-run] would wait for you to: $*"; return 0; fi
+	printf '\n  %s>> %s%s\n' "$B$YEL" "$*" "$N"
+	read -r -p "     Press Enter when that's done. " _ </dev/tty
+}
+
+# ----------------------------------------------------------------- state
+state_get() { [ -f "$ST/state" ] && sed -n "s|^$1=||p" "$ST/state" | tail -n 1; return 0; }
+state_set() {
+	[ "$DRY" = 1 ] && return 0
+	mkdir -p "$ST"
+	{ grep -v "^$1=" "$ST/state" 2>/dev/null; printf '%s=%s\n' "$1" "$2"; } > "$ST/state.new"
+	mv "$ST/state.new" "$ST/state"
+}
+done_p() { [ "$(state_get "done_$1")" = 1 ]; }
+
+# ------------------------------------------------------------ SSH plumbing
+# Box identity = the SSH host keys this script generates and builds into the
+# card (t95-sd) and the eMMC install (t95-emmc). No trust-on-first-use, and the
+# box can be found on the network by scanning for its key.
+CTL=${XDG_RUNTIME_DIR:-/tmp}/t95-setup-$UID
+ssh_opts() {
+	[ -d "$CTL" ] || { mkdir -p "$CTL" && chmod 700 "$CTL"; }
+	SSHO=(-p "$PORT" -o UserKnownHostsFile="$ST/known_hosts" -o GlobalKnownHostsFile=/dev/null
+		-o StrictHostKeyChecking=yes -o HostKeyAlias="t95-$1" -o ConnectTimeout=10
+		-o ServerAliveInterval=10 -o ServerAliveCountMax=6
+		-o ControlMaster=auto -o ControlPath="$CTL/$1-%C" -o ControlPersist=600)
+	local id; id=$(state_get identity)
+	[ -z "$id" ] || SSHO+=(-i "$id" -o IdentitiesOnly=yes)
+}
+box() { printf '%s@%s' "$BOXUSER" "$(state_get ip)"; }
+# bssh ALIAS CMD: no stdin.  bssh_in ALIAS CMD: stdin goes to the box.
+bssh()    { local a=$1; shift; ssh_opts "$a"; ssh -n "${SSHO[@]}" "$(box)" "$@"; }
+bssh_in() { local a=$1; shift; ssh_opts "$a"; ssh "${SSHO[@]}" "$(box)" "$@"; }
+ssh_close() { local a; for a in sd emmc; do ssh_opts "$a"; ssh -O exit "${SSHO[@]}" "$(box)" >/dev/null 2>&1; done; return 0; }
+
+need_boxpw() {
+	[ -n "$BOXPW" ] && return 0
+	local _
+	# messages go to stderr: this may run inside a $(...)
+	for _ in 1 2 3; do
+		read -r -s -p "  Password of '$BOXUSER' on the box (for sudo there): " BOXPW </dev/tty; echo >&2
+		printf '%s\n' "$BOXPW" | bssh_in "$1" "sudo -S -p '' -v" 2>/dev/null && return 0
+		warn "that didn't work" >&2; BOXPW=''
+	done
+	die "no sudo on the box"
+}
+# bsudo ALIAS CMD: CMD as root. The password is the only stdin sudo gets.
+bsudo() {
+	local a=$1; shift
+	if [ "$DRY" = 1 ]; then say "  [dry-run] on the box, as root: $*"; return 0; fi
+	need_boxpw "$a"
+	printf '%s\n' "$BOXPW" | bssh_in "$a" "sudo -S -p '' $*"
+}
+# broot ALIAS SCRIPT ARGS...: run a bash script as root on the box
+broot() {
+	local a=$1 s=$2; shift 2
+	if [ "$DRY" = 1 ]; then say "  [dry-run] on the box, as root: script ($(printf '%s' "$s" | grep -m1 '^#' | sed 's/^# *//')) $*"; return 0; fi
+	need_boxpw "$a"
+	local f=/tmp/t95-setup.$$.$RANDOM
+	printf '%s\n' "$s" | bssh_in "$a" "umask 077; cat > $f" || return 1
+	bsudo "$a" "bash $f $*; rc=\$?; rm -f $f; exit \$rc"
+}
+
+# ------------------------------------------------------- finding the box
+my_subnets() {
+	ip -4 -o addr show scope global 2>/dev/null |
+		awk '$2 !~ /^(docker|br-|virbr|veth|tailscale|wg|tun|zt|lxc|vnet|podman)/ {print $4}' |
+		while read -r c; do [ "${c#*/}" -ge 22 ] && [ "${c#*/}" -le 30 ] && echo "$c"; done
+}
+my_ips() { ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}'; }
+# IPs in the given CIDRs with the SSH port open
+ssh_hosts_in() {
+	[ $# -gt 0 ] || return 0
+	if command -v nmap >/dev/null; then
+		nmap -n -sT -p "$PORT" --open -T4 -oG - "$@" 2>/dev/null | awk '/\/open\//{print $2}'
+	else
+		python3 -I - "$@" <<-'PY' | T95P=$PORT xargs -r -P 64 -n 1 sh -c 'timeout 1 bash -c "exec 3<>/dev/tcp/$1/$T95P" 2>/dev/null && echo "$1"' sh
+		import ipaddress, sys
+		for n in sys.argv[1:]:
+		    for h in ipaddress.ip_network(n, strict=False).hosts():
+		        print(h)
+		PY
+	fi
+}
+# keyscan_match "IPS" ALIAS...: sets FOUND_IP/FOUND_AS if one of IPS has the
+# host key of one of the aliases
+keyscan_match() {
+	local ips=$1 a key ip scan; shift
+	[ -n "$ips" ] || return 1
+	# shellcheck disable=SC2086 # one host per word
+	scan=$(ssh-keyscan -T 3 -p "$PORT" -t ed25519 $ips 2>/dev/null)
+	for a in "$@"; do
+		key=$(cut -d' ' -f1,2 "$ST/hostkeys/$a/etc/ssh/ssh_host_ed25519_key.pub" 2>/dev/null) || continue
+		ip=$(awk -v k="$key" '$2" "$3 == k {print $1; exit}' <<<"$scan")
+		ip=${ip#[}; ip=${ip%%]*}
+		[ -n "$ip" ] && { FOUND_IP=$ip; FOUND_AS=$a; return 0; }
+	done
+	return 1
+}
+find_box() {
+	local deadline=$((SECONDS + ${T95_FIND_TIMEOUT:-900})) cand n=0
+	if [ "$DRY" = 1 ]; then FOUND_IP=192.0.2.10 FOUND_AS=$1; say "  [dry-run] would scan the network for the box's SSH key ($*)"; return 0; fi
+	printf '  looking for the box on your network (by its SSH key) ' >&2
+	while [ $SECONDS -lt $deadline ]; do
+		# shellcheck disable=SC2046 # subnets are single words
+		cand=$({ [ -n "$HOST_OPT" ] && echo "$HOST_OPT"; state_get ip
+			[ -n "$HOST_OPT" ] || ssh_hosts_in $(my_subnets); } |
+			grep -vxF -f <(my_ips; echo 0.0.0.0) | awk 'NF && !s[$0]++')
+		if keyscan_match "$cand" "$@"; then printf ' found %s\n' "$FOUND_IP" >&2; return 0; fi
+		n=$((n + 1)); [ $((n % 6)) = 0 ] && printf '%dm ' $(( (${T95_FIND_TIMEOUT:-900} - deadline + SECONDS) / 60 )) >&2 || printf . >&2
+		sleep 5
+	done
+	echo >&2; return 1
+}
+# make sure the stored IP still answers with this alias's key, else rescan
+ensure_ip() {
+	[ "$DRY" = 1 ] && return 0
+	local ip; ip=${HOST_OPT:-$(state_get ip)}
+	if [ -n "$ip" ] && keyscan_match "$ip" "$1"; then state_set ip "$FOUND_IP"; return 0; fi
+	find_box "$1" || die "can't find the box (t95-$1) on the network. Is it on, with its network adapter plugged in? You can also give --host IP."
+	state_set ip "$FOUND_IP"
+}
+remote_label() { bssh "$1" 'lsblk -no LABEL "$(findmnt -no SOURCE /)"'; }
+remote_emmc() {
+	bssh "$1" 'for d in /sys/block/mmcblk[0-9]; do [ "$(cat $d/device/type 2>/dev/null)" = MMC ] && echo /dev/${d##*/}; done' | head -n 1
+}
+wait_gone() { local _; for _ in $(seq 1 45); do keyscan_match "$(state_get ip)" "$1" || return 0; sleep 2; done; return 1; }
+
+# ===================================================================== prep
+PKGS=(gcc-aarch64-linux-gnu make bison flex swig bc python3-dev python3-setuptools
+	python3-pyelftools libssl-dev libgnutls28-dev device-tree-compiler mmdebstrap
+	qemu-user-static binfmt-support uidmap fakeroot e2fsprogs zstd rsync git
+	adb openssh-client openssl gnupg curl fdisk util-linux iproute2 python3)
+
+phase_prep() {
+	step "Checking this PC"
+	[ "$(uname -m)" = x86_64 ] && ok "x86-64 Linux" || warn "this is $(uname -m); the build scripts were written for an x86-64 PC"
+	local missing=() p
+	for p in "${PKGS[@]}"; do
+		dpkg-query -W -f='${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^ii' || missing+=("$p")
+	done
+	if [ ${#missing[@]} = 0 ]; then ok "build packages installed"
+	elif command -v apt-get >/dev/null; then
+		say "  installing: ${missing[*]} (sudo asks for your PC password)"
+		run sudo apt-get update -q && run sudo apt-get install -y "${missing[@]}" || die "package install failed"
+	else die "install these packages, then rerun: ${missing[*]}"; fi
+
+	local me; me=$(id -un)
+	if grep -q "^$me:" /etc/subuid 2>/dev/null && grep -q "^$me:" /etc/subgid 2>/dev/null; then
+		ok "subordinate IDs for $me (rootless mmdebstrap)"
+	else
+		local from; from=$(awk -F: '{e = $2 + $3; if (e > m) m = e} END {print (m < 100000 ? 100000 : m)}' /etc/subuid /etc/subgid 2>/dev/null)
+		say "  $me has no subordinate IDs (mmdebstrap needs them); adding $from-$((from + 65535))"
+		run sudo usermod --add-subuids "$from-$((from + 65535))" --add-subgids "$from-$((from + 65535))" "$me" || die "usermod failed"
+	fi
+	if [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then ok "arm64 emulation (qemu-user binfmt) active"
+	else
+		say "  enabling arm64 emulation"
+		run sudo systemctl restart systemd-binfmt 2>/dev/null || run sudo update-binfmts --enable qemu-aarch64
+		[ "$DRY" = 1 ] || [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] || die "qemu-aarch64 binfmt still not registered"
+	fi
+
+	step "Fetching sources"
+	mkdir -p "$W/src"
+	clone_pinned u-boot "$UBOOT_TAG" https://source.denx.de/u-boot/u-boot.git
+	clone_pinned tf-a "$TFA_TAG" https://git.trustedfirmware.org/TF-A/trusted-firmware-a.git
+	if [ -d "$W/src/linux-6.12/.git" ]; then ok "src/linux-6.12 (device-tree includes)"
+	else
+		run git clone --depth 1 -b "$LINUX_TAG" --filter=blob:none --sparse \
+			https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git "$W/src/linux-6.12" &&
+		run git -C "$W/src/linux-6.12" sparse-checkout set arch/arm64/boot/dts/allwinner \
+			arch/arm/boot/dts/allwinner include/dt-bindings scripts/dtc/include-prefixes ||
+			die "linux clone failed"
+	fi
+
+	step "Debian signing keys"
+	fetch_keyring
+}
+
+clone_pinned() {
+	local d=$W/src/$1 t
+	if [ -d "$d/.git" ]; then
+		t=$(git -C "$d" describe --tags --exact-match 2>/dev/null)
+		[ "$t" = "$2" ] && ok "src/$1 at $2" || warn "src/$1 is at ${t:-an untagged commit}; README pins $2 (left alone)"
+		return 0
+	fi
+	run git clone --depth 1 -b "$2" "$3" "$d" || die "clone of $3 failed"
+}
+
+fprs_of() { # keyring/key file -> its fingerprints
+	local g; g=$(mktemp -d)
+	GNUPGHOME=$g gpg --batch --show-keys --with-colons "$1" 2>/dev/null | awk -F: '$1 == "fpr" {print $10}'
+	rm -rf "$g"
+}
+keyring_ok() {
+	[ -s "$KEYRING" ] || return 1
+	local have f; have=$(fprs_of "$KEYRING")
+	for f in "${TRIXIE_FPRS[@]}"; do grep -qx "$f" <<<"$have" || return 1; done
+}
+# Same result as the README's manual step (Debian keyring checked against
+# ftp-master.debian.org): the trixie keys, each checked against the fingerprint
+# pinned above AND the one on keys.html.
+fetch_keyring() {
+	if keyring_ok; then ok "keyring has the Debian 13 archive keys"; return 0; fi
+	if [ "$DRY" = 1 ]; then say "  [dry-run] download ${KEY_URLS[*]}, check fingerprints, write ${KEYRING#"$W"/}"; return 0; fi
+	local t u f fp page; t=$(mktemp -d); mkdir -p "$t/k" "$t/g"; chmod 700 "$t/g"
+	page=$(curl -fsSL --proto '=https' --tlsv1.2 https://ftp-master.debian.org/keys.html) ||
+		{ rm -rf "$t"; die "can't reach ftp-master.debian.org - see README 'Debian keyring' to do it by hand"; }
+	page=$(sed 's/<[^>]*>//g; s/&nbsp;/ /g' <<<"$page" | tr -d ' \t\r\n' | tr a-f A-F)
+	for u in "${KEY_URLS[@]}"; do
+		f=$t/k/${u##*/}
+		curl -fsSL --proto '=https' --tlsv1.2 -o "$f" "$u" || { rm -rf "$t"; die "download failed: $u"; }
+		fp=$(fprs_of "$f" | head -n 1)
+		printf '%s\n' "${TRIXIE_FPRS[@]}" | grep -qx "$fp" || { rm -rf "$t"; die "${u##*/}: fingerprint ${fp:-?} is not the pinned one - stopping"; }
+		grep -q "$fp" <<<"$page" || { rm -rf "$t"; die "${u##*/}: fingerprint $fp not listed on keys.html - stopping"; }
+		GNUPGHOME=$t/g gpg --batch --dearmor < "$f" > "$f.bin" || { rm -rf "$t"; die "gpg --dearmor failed"; }
+		ok "${u##*/}: $fp"
+	done
+	mkdir -p "$(dirname "$KEYRING")"
+	cat "$t"/k/*.bin > "$KEYRING"; rm -rf "$t"
+	keyring_ok && ok "wrote ${KEYRING#"$W"/}" || die "keyring check failed after writing it"
+}
+
+# =================================================================== doctor
+adb_() { adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} "$@"; }
+ash() { adb_ shell "$1" 2>/dev/null | tr -d '\r'; }
+arsh() { if [ "$AROOT" = su ]; then adb_ shell "su -c '$1'" 2>/dev/null | tr -d '\r'; else ash "$1"; fi; }
+arexec() { if [ "$AROOT" = su ]; then adb_ exec-out "su -c '$1'"; else adb_ exec-out "$1"; fi; }
+
+adb_connect() {
+	local t=$ADB_TARGET devs n
+	ADB_SERIAL=
+	adb start-server >/dev/null 2>&1
+	while :; do
+		if [[ $t == *.*.*.* ]]; then [[ $t == *:* ]] || t=$t:5555; adb connect "$t" >/dev/null 2>&1; ADB_SERIAL=$t
+		elif [ -n "$t" ]; then ADB_SERIAL=$t; fi
+		devs=$(adb devices | awk -v s="$ADB_SERIAL" 'NR > 1 && NF >= 2 && (s == "" || $1 == s) {print $1, $2}')
+		n=$(grep -c . <<<"$devs")
+		if [ "$n" = 1 ]; then
+			case ${devs#* } in
+			device) ADB_SERIAL=${devs%% *}; ok "adb: connected to $ADB_SERIAL"; return 0 ;;
+			unauthorized) say "  On the TV: allow the 'USB debugging' prompt (tick 'Always allow')."; sleep 4; continue ;;
+			*) warn "adb: $devs (USB permissions? network adb avoids that)" ;;
+			esac
+		elif [ "$n" -gt 1 ]; then
+			say "$devs" | sed 's/^/    /'
+			read -r -p "  Several adb devices - type the box's serial: " t </dev/tty; continue
+		fi
+		say "  Connect to the box's Android with adb: give its IP for network adb (Android:"
+		say "  Settings > Network shows it; ADB debugging must be on in Developer options),"
+		read -r -p "  or plug in a USB A-to-A cable and press Enter. IP / Enter / 'skip': " t </dev/tty
+		[ "$t" = skip ] && return 1
+	done
+}
+adb_root() {
+	AROOT=
+	adb_ root >/dev/null 2>&1; sleep 3
+	[[ $ADB_SERIAL == *:* ]] && adb connect "$ADB_SERIAL" >/dev/null 2>&1
+	timeout 20 adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} wait-for-device 2>/dev/null
+	[ "$(ash 'id -u')" = 0 ] && { AROOT=adbd; return 0; }
+	[ "$(adb_ shell "su -c 'id -u'" 2>/dev/null | tr -d '\r')" = 0 ] && { AROOT=su; return 0; }
+	return 1
+}
+
+# DRAM settings: find this build's DRAM values (defconfig) close together in
+# the factory bootloader at the start of the eMMC. Prints: matched total offset missing...
+dram_scan() {
+	python3 -I - "$1" "$W/board/t95_h616_defconfig" <<-'PY'
+	import re, sys
+	data = open(sys.argv[1], 'rb').read()
+	want = {}
+	for line in open(sys.argv[2]):
+	    m = re.match(r'CONFIG_(DRAM_CLK|DRAM_SUNXI_\w+)=(\S+)', line.strip())
+	    if m and int(m.group(2), 0) >= 0x100:   # tiny values match anywhere
+	        want[m.group(1)] = int(m.group(2), 0)
+	pos = {k: [m.start() for m in re.finditer(re.escape(v.to_bytes(4, 'little')), data)]
+	       for k, v in want.items()}
+	best, at = set(), None
+	for ps in pos.values():
+	    for a in ps:
+	        hit = {k for k, qs in pos.items() if any(abs(q - a) <= 512 for q in qs)}
+	        if len(hit) > len(best):
+	            best, at = hit, a
+	print(len(best), len(want), hex(at) if at is not None else '-', *sorted(set(want) - best))
+	PY
+}
+
+phase_doctor() {
+	step "Doctor: is this the board the image is made for? (read-only, from Android)"
+	if [ "$DRY" = 1 ]; then say "  [dry-run] adb: SoC + key fuse, power chip, Wi-Fi chip, RAM, eMMC, factory DRAM settings"; return 0; fi
+	command -v adb >/dev/null || die "adb missing - run: ./t95-setup prep"
+	if ! adb_connect; then
+		warn "doctor skipped: the first boot from SD tests the same things (harmlessly - it just won't start on the wrong board)"
+		state_set doctor skipped; return 0
+	fi
+	local d=$ST/doctor fails=0; mkdir -p "$d"; REPORT=$d/report.txt; : > "$REPORT"
+	adb_root || warn "no root over adb: skipping the power chip (device tree), DRAM settings and malware checks"
+
+	info "Android: model $(ash 'getprop ro.product.model'), build $(ash 'getprop ro.build.display.id')"
+	local sysinfo compat soc
+	sysinfo=$(ash 'cat /sys/class/sunxi_info/sys_info')
+	compat=$(adb_ shell 'cat /proc/device-tree/compatible' 2>/dev/null | tr '\0\r' '  ')
+	soc="$compat $(ash 'getprop ro.board.platform') $sysinfo"
+	if grep -qiE 'sun50iw9|h616|h313' <<<"$soc"; then ok "SoC: Allwinner H616 family (sun50iw9)"
+	elif [ -n "${soc// /}" ]; then bad "SoC: not an H616 (${compat:0:60}) - this image can't boot on it"; fails=$((fails + 1))
+	else warn "SoC: couldn't identify it"; fi
+
+	local rotpk secure
+	rotpk=$(sed -n 's/^[[:space:]]*sunxi_rotpk[[:space:]]*:[[:space:]]*//p' <<<"$sysinfo" | head -n 1)
+	secure=$(sed -n 's/^[[:space:]]*sunxi_secure[[:space:]]*:[[:space:]]*//p' <<<"$sysinfo" | head -n 1)
+	case $rotpk in
+	0) ok "secure boot: ${secure:-on}; root-key fuse empty, so a bootloader signed with your own key is accepted" ;;
+	'') warn "root-key fuse: couldn't read it (if it were set, the card simply wouldn't boot)" ;;
+	*) bad "root-key fuse is programmed ($rotpk): only the maker's signed bootloader runs"; fails=$((fails + 1)) ;;
+	esac
+
+	local pm=
+	if [ -n "$AROOT" ]; then
+		arexec 'cat /sys/firmware/fdt' > "$d/android.dtb" 2>/dev/null
+		[ -s "$d/android.dtb" ] && dtc -q -I dtb -O dts -o "$d/android.dts" "$d/android.dtb" 2>/dev/null
+	fi
+	pm=$({ ash 'cat /sys/bus/i2c/devices/*/name'; [ -s "$d/android.dtb" ] && cat "$d/android.dtb"; } |
+		grep -aoiE 'axp[0-9]{3,4}[a-z]?' | tr '[:upper:]' '[:lower:]' | sort -u | tr '\n' ' ')
+	case " $pm" in
+	*" axp1530"* | *" axp313"*) ok "power chip: ${pm% } (AXP1530 / AXP313-compatible: matches)" ;;
+	" ") warn "power chip: couldn't identify it" ;;
+	*) bad "power chip: ${pm% } - the supported board has an AXP1530 (different T95 board)"; fails=$((fails + 1)) ;;
+	esac
+
+	local sdio
+	# shellcheck disable=SC2016 # expanded by Android's shell
+	sdio=$(ash 'for d in /sys/bus/sdio/devices/*; do echo $(cat $d/vendor) $(cat $d/device); done' | tr 'A-F' 'a-f' | grep '0x')
+	case $sdio in
+	*"0x02d0 0x4334"*) ok "Wi-Fi chip: BCM43342 (matches)" ;;
+	*"0x0020 0x2281"*) bad "Wi-Fi chip: XR819 - that's the H616-T95MAX-v4.0 board, not the supported one"; fails=$((fails + 1)) ;;
+	'') warn "Wi-Fi chip: not visible (turn Wi-Fi on in Android and rerun ./t95-setup doctor to check it)" ;;
+	*) warn "Wi-Fi chip: SDIO ${sdio//$'\n'/, } (unknown; the supported board has BCM43342, 02d0:4334)" ;;
+	esac
+
+	local memk; memk=$(ash 'cat /proc/meminfo' | awk '/^MemTotal/ {print $2}')
+	if [ "${memk:-0}" -ge 3000000 ]; then ok "RAM: $((memk / 1024)) MiB visible to Android (4 GB)"
+	else warn "RAM: $((${memk:-0} / 1024)) MiB - not a 4 GB box; the image was tuned on 4 GB but may still work"; fi
+
+	local emmc sz
+	# shellcheck disable=SC2016
+	emmc=$(ash 'for d in /sys/block/mmcblk[0-9]; do [ "$(cat $d/device/type 2>/dev/null)" = MMC ] && echo ${d##*/}; done' | head -n 1)
+	if [ -z "$emmc" ]; then bad "eMMC: not found"; fails=$((fails + 1))
+	else sz=$(ash "cat /sys/block/$emmc/size"); ok "eMMC: $emmc, $((${sz:-0} * 512 / 1000000000)) GB"; fi
+
+	if [ -n "$AROOT" ] && [ -n "$emmc" ]; then
+		arexec "dd if=/dev/block/$emmc bs=1048576 count=4 2>/dev/null" > "$d/emmc-head.bin"
+		local got tot at missing
+		read -r got tot at missing <<<"$(dram_scan "$d/emmc-head.bin")"
+		if [ "${tot:-0}" -gt 0 ] && [ "$got" = "$tot" ]; then ok "DRAM settings: the factory bootloader has the same $tot values as this build (at $at)"
+		elif [ "${got:-0}" -ge $((${tot:-0} - 2)) ] && [ "${got:-0}" -gt 0 ]; then warn "DRAM settings: $got of $tot match (not found: $missing) - may still boot"
+		else warn "DRAM settings: not found in the factory bootloader - the SD boot is the real test (wrong values only mean it won't start)"; fi
+
+		if [ -n "$(arsh 'ls -d /data/system/Corejava 2>/dev/null')" ]; then
+			info "malware: /data/system/Corejava is present - expected on this box; the eMMC install erases it"
+		else
+			info "malware: no /data/system/Corejava here (the eMMC install erases all of Android either way)"
+		fi
+	fi
+	REPORT=
+	say "  report: ${d#"$W"/}/report.txt"
+	if [ $fails -gt 0 ]; then
+		[ "$FORCE" = 1 ] && { warn "going on anyway (--force)"; return 0; }
+		die "this doesn't look like the supported board (see above). Nothing was changed on the box."
+	fi
+}
+
+# ==================================================================== build
+host_tz() {
+	local z; z=$(timedatectl show -p Timezone --value 2>/dev/null)
+	[ -n "$z" ] || z=$(cat /etc/timezone 2>/dev/null)
+	[ -n "$z" ] || z=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')
+	echo "${z:-Etc/UTC}"
+}
+pick_pubkey() {
+	local k=${T95_PUBKEY:-$(state_get pubkey)} c
+	if [ -z "$k" ]; then for c in ~/.ssh/id_ed25519.pub ~/.ssh/id_ecdsa.pub ~/.ssh/id_rsa.pub; do [ -f "$c" ] && { k=$c; break; }; done; fi
+	if [ -z "$k" ]; then
+		say "  No SSH key on this PC yet - making one (~/.ssh/id_ed25519). A passphrase is optional."
+		run ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 </dev/tty || die "ssh-keygen failed"
+		k=~/.ssh/id_ed25519.pub
+	fi
+	[ "$DRY" = 1 ] || [ -f "$k" ] || die "SSH public key $k not found"
+	PUBKEY=$k
+	state_set pubkey "$k"
+	# the private half if it's a file; else the .pub lets ssh pick the agent's key
+	if [ -f "${k%.pub}" ]; then state_set identity "${k%.pub}"; else state_set identity "$k"; fi
+	ok "SSH login key: $k"
+}
+choose_password() {
+	local p1 p2
+	if [ "$DRY" = 1 ]; then say "  [dry-run] would ask you to choose the box password"; return 0; fi
+	say "  Choose a password for '$BOXUSER' on the box. You'll need it for sudo there;"
+	say "  logins use your SSH key. Only a hash of it is stored (.t95-setup/pwhash)."
+	while :; do
+		read -r -s -p "  Password: " p1 </dev/tty; echo
+		[ ${#p1} -ge 8 ] || { warn "use at least 8 characters"; continue; }
+		read -r -s -p "  Again: " p2 </dev/tty; echo
+		[ "$p1" = "$p2" ] && break
+		warn "they didn't match"
+	done
+	(umask 077; mkdir -p "$ST"; printf '%s' "$p1" | openssl passwd -6 -stdin > "$ST/pwhash") || die "openssl passwd failed"
+	BOXPW=$p1
+}
+gen_hostkeys() {
+	local d=$ST/hostkeys/$1/etc/ssh t
+	[ "$DRY" = 1 ] && { say "  [dry-run] SSH host keys for t95-$1 in .t95-setup/hostkeys/$1"; return 0; }
+	if [ ! -f "$d/ssh_host_ed25519_key" ]; then
+		mkdir -p "$d"; chmod 700 "$ST/hostkeys"
+		for t in ed25519 ecdsa rsa; do
+			ssh-keygen -q -t $t -N '' -C "root@t95-$1" -f "$d/ssh_host_${t}_key" || die "ssh-keygen failed"
+		done
+	fi
+	chmod 600 "$d"/ssh_host_*_key; chmod 644 "$d"/ssh_host_*_key.pub
+	touch "$ST/known_hosts"
+	grep -v "^t95-$1 " "$ST/known_hosts" > "$ST/known_hosts.new"
+	for t in ed25519 ecdsa rsa; do printf 't95-%s %s\n' "$1" "$(cut -d' ' -f1,2 "$d/ssh_host_${t}_key.pub")"; done >> "$ST/known_hosts.new"
+	mv "$ST/known_hosts.new" "$ST/known_hosts"
+}
+
+phase_build() {
+	step "Building the image"
+	{ [ -d "$W/src/u-boot" ] && keyring_ok; } || [ "$DRY" = 1 ] || die "sources or keyring missing - run: ./t95-setup prep"
+	pick_pubkey
+	local env=(T95_USER="$BOXUSER" T95_PUBKEY="$PUBKEY" T95_TZ="$(host_tz)")
+	if grep -q T95_PASSWORD_HASHFILE "$W/board/build-rootfs.sh"; then
+		if [ -s "$ST/pwhash" ]; then ok "password: the one you chose before (delete .t95-setup/pwhash to choose again)"
+		else choose_password; fi
+		env+=(T95_PASSWORD_HASHFILE="$ST/pwhash" T95_EXPIRE_PASSWORD=0)
+		state_set pwmode chosen
+	else
+		warn "this board/build-rootfs.sh can't take your password: the box starts with '$BOXUSER'/'$BOXUSER' and asks for a new one at first login"
+		state_set pwmode default
+	fi
+	gen_hostkeys sd; gen_hostkeys emmc
+	ok "timezone: $(host_tz) (from this PC)"
+
+	say "  U-Boot + TF-A"
+	run "$W/board/build-uboot.sh" || die "board/build-uboot.sh failed"
+	run "$W/board/build-dtb.sh" || die "board/build-dtb.sh failed"
+	say "  Debian root filesystem (about 30 minutes, downloads from deb.debian.org)"
+	run env "${env[@]}" "$W/board/build-rootfs.sh" || die "board/build-rootfs.sh failed"
+	build_image
+	ok "SD image: out/t95-sd.img"
+}
+# The card gets the t95-sd host keys: append them to rootfs.tar, assemble the
+# image, take them out again (rootfs.tar stays key-free)
+build_image() {
+	local tar=$W/out/rootfs.tar stage=$ST/hostkeys/sd names=() t rc
+	for t in ed25519 ecdsa rsa; do names+=("./etc/ssh/ssh_host_${t}_key" "./etc/ssh/ssh_host_${t}_key.pub"); done
+	if [ "$DRY" = 1 ]; then say "  [dry-run] add the card's SSH host keys to out/rootfs.tar, run board/build-sdimage.sh, remove them"; return 0; fi
+	tar --append -f "$tar" --owner=0 --group=0 --numeric-owner -C "$stage" "${names[@]}" || die "couldn't add host keys to $tar"
+	"$W/board/build-sdimage.sh"; rc=$?
+	tar --delete -f "$tar" "${names[@]}" || warn "couldn't take the host keys out of out/rootfs.tar again - don't share that file"
+	[ $rc = 0 ] || die "board/build-sdimage.sh failed"
+}
+
+# ===================================================================== card
+list_cards() { # path<TAB>size<TAB>description, removable disks not in use by this PC
+	python3 -I - <<-'PY'
+	import json, subprocess
+	out = subprocess.run(['lsblk', '-J', '-b', '-o', 'PATH,SIZE,RM,HOTPLUG,TRAN,TYPE,MODEL,VENDOR,MOUNTPOINTS'],
+	                     capture_output=True, text=True).stdout
+	def yes(v): return v in (True, 1, '1')
+	def mounts(d):
+	    m = [x for x in (d.get('mountpoints') or []) if x]
+	    for c in d.get('children') or []:
+	        m += mounts(c)
+	    return m
+	for d in json.loads(out or '{"blockdevices": []}')['blockdevices']:
+	    if d.get('type') != 'disk':
+	        continue
+	    removable = yes(d.get('rm')) or yes(d.get('hotplug')) or d.get('tran') == 'usb' or d['path'].startswith('/dev/mmcblk')
+	    size = int(d.get('size') or 0)
+	    if not removable or not 1.5e9 <= size <= 512e9:
+	        continue
+	    if any(not m.startswith(('/media/', '/run/media/', '/mnt/')) for m in mounts(d)):
+	        continue        # holds something this PC uses
+	    desc = ' '.join(x for x in ((d.get('vendor') or '').strip(), (d.get('model') or '').strip(), d.get('tran') or '') if x)
+	    print(f"{d['path']}\t{size / 1e9:.1f} GB\t{desc or 'card reader'}")
+	PY
+}
+phase_card() {
+	step "Writing the SD card"
+	local img=$W/out/t95-sd.img cards card='' desc n p
+	[ -f "$img" ] || [ "$DRY" = 1 ] || die "no out/t95-sd.img - run: ./t95-setup build"
+	cards=$(list_cards)
+	if [ -z "$cards" ]; then
+		say "  Put the microSD card (4 GB or more) in this PC's card reader..."
+		until cards=$(list_cards); [ -n "$cards" ]; do [ "$DRY" = 1 ] && break; sleep 2; done
+	fi
+	n=$(grep -c . <<<"$cards")
+	if [ "$n" = 1 ]; then card=$(cut -f1 <<<"$cards")
+	elif [ "$n" -gt 1 ]; then
+		say "  Removable disks:"; sed 's/^/    /; s/\t/   /g' <<<"$cards"
+		read -r -p "  Which one is the card for the box? Type its path: " card </dev/tty
+		grep -q "^$card"$'\t' <<<"$cards" || die "$card isn't one of them"
+	elif [ "$DRY" = 1 ]; then card=/dev/sdX; fi
+	desc=$(grep "^$card"$'\t' <<<"$cards" | cut -f2,3 | tr '\t' ' ')
+	ask_yes "Write the image to $card (${desc:-?})? EVERYTHING on it will be erased." "${card##*/}" || die "stopped - nothing written"
+	[ "$DRY" = 1 ] || grep -q "^$card"$'\t'"${desc%% GB*} GB" <<<"$(list_cards)" || die "$card changed or went away - nothing written"
+	for p in $(lsblk -lnpo NAME "$card" 2>/dev/null | tail -n +2); do
+		findmnt -rn -S "$p" >/dev/null && { run udisksctl unmount -b "$p" >/dev/null 2>&1 || run sudo umount "$p"; }
+	done
+	say "  writing (sudo asks for your PC password)"
+	run sudo dd if="$img" of="$card" bs=4M conv=fsync status=progress || die "writing the card failed"
+	if [ "$DRY" = 0 ]; then
+		say "  reading it back to check"
+		sudo blockdev --flushbufs "$card"
+		local want got mb=$(( $(stat -c %s "$img") / 1048576 ))
+		want=$(sha256sum < "$img" | cut -c1-64)
+		got=$(sudo dd if="$card" bs=1M count="$mb" iflag=direct status=none | sha256sum | cut -c1-64)
+		[ "$want" = "$got" ] || die "the card reads back differently from the image - try another card"
+		ok "card written and verified"
+	fi
+	say "  You can take the card out now."
+}
+
+# ===================================================================== boot
+phase_boot() {
+	step "First boot from the SD card"
+	pause "Put the card in the box, connect the box's USB Ethernet adapter to your router, then plug in the box's power."
+	find_box sd || die "the box didn't show up within 15 minutes. Check power and the network cable, then run ./t95-setup boot again (or --host IP)."
+	state_set ip "$FOUND_IP"
+	ok "the box is at $FOUND_IP and has the card's SSH key"
+	if [ "$(state_get pwmode)" = default ] && [ "$(state_get first_login)" != 1 ]; then
+		say "  First login: the box asks for the current password ('$BOXUSER') and a new one, twice."
+		if [ "$DRY" = 0 ]; then ssh_opts sd; ssh -t "${SSHO[@]}" "$(box)" true; fi
+		state_set first_login 1
+	fi
+	[ "$DRY" = 1 ] || bssh sd true || die "SSH login with your key failed"
+	ok "logged in with your SSH key"
+}
+
+# ==================================================================== check
+read -r -d '' CHECK_SCRIPT <<'EOF'
+# health checks
+export LC_ALL=C
+want=${1:-}
+out() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
+src=$(findmnt -no SOURCE /); lbl=$(lsblk -no LABEL "$src")
+if [ -n "$want" ] && [ "$lbl" != "$want" ]; then out FAIL boot "running from $src ($lbl), expected $want"
+else out PASS boot "running from $src ($lbl)"; fi
+timeout 180 systemctl is-system-running --wait >/dev/null 2>&1
+mem=$(awk '/^MemTotal/ {print int($2 / 1024)}' /proc/meminfo)
+if [ "$mem" -ge 3800 ]; then out PASS ram "$mem MiB (all 4 GiB)"
+elif [ "$mem" -ge 1800 ]; then out WARN ram "$mem MiB - a 2 GiB box (the label lies), or RAM detection failed"
+else out FAIL ram "$mem MiB"; fi
+drv=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null)
+max=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0) / 1000 ))
+if [ "$(nproc --all)" = 4 ] && [ "$drv" = cpufreq-dt ]; then out PASS cpu "4 cores, frequency scaling up to $max MHz"
+else out WARN cpu "$(nproc --all) cores, scaling driver ${drv:-none}"; fi
+t= cz=
+for z in /sys/class/thermal/thermal_zone*; do
+	[ "$(cat "$z/type" 2>/dev/null)" = cpu-thermal ] && { t=$(( $(cat "$z/temp") / 1000 )); cz=$z; }
+done
+if [ -z "$t" ]; then out WARN thermal "no cpu-thermal zone"
+elif ls -d "$cz"/cdev* >/dev/null 2>&1; then out PASS thermal "CPU at $t C, throttling wired up"
+else out WARN thermal "CPU at $t C, but no cooling map (no throttling)"; fi
+emmc=
+for d in /sys/block/mmcblk[0-9]; do [ "$(cat "$d/device/type" 2>/dev/null)" = MMC ] && emmc=/dev/${d##*/}; done
+klog=$(journalctl -k -b -o cat --no-pager 2>/dev/null)
+if [ -z "$emmc" ]; then out FAIL emmc "no eMMC found"
+else
+	gb=$(( $(cat "/sys/block/${emmc#/dev/}/size") * 512 / 1000000000 ))
+	mode=$(grep -oE 'mmc[0-9]+: new [A-Za-z0-9 ]*MMC card' <<<"$klog" | tail -n 1)
+	case $mode in
+	*DDR* | *HS200* | *HS400*) out FAIL emmc-mode "$mode - this board's eMMC hangs in DDR/HS200 modes" ;;
+	'') out WARN emmc-mode "couldn't find the eMMC speed mode in the kernel log" ;;
+	*) out PASS emmc-mode "$mode (SDR, the mode that's stable on this board)" ;;
+	esac
+	s=$(date +%s%N)
+	if dd if="$emmc" of=/dev/null bs=4M count=128 iflag=direct status=none; then
+		ms=$(( ($(date +%s%N) - s) / 1000000 )); out PASS emmc "$emmc, $gb GB, reads at $(( 512000 / (ms + 1) )) MB/s"
+	else out FAIL emmc "$emmc: read error"; fi
+fi
+hang=$(grep -ciE 'send stop command failed|data error, sending stop|update clk timeout|blocked for more than|soft lockup|hard lockup' <<<"$klog")
+other=$(grep -iE 'mmc[0-9]+:.*(error|timeout|failed)|oops|call trace' <<<"$klog" | grep -viE 'send stop command failed|data error, sending stop|update clk timeout')
+if [ "$hang" != 0 ]; then out FAIL kernel "$hang eMMC hang / lockup messages in the kernel log"
+elif [ -n "$other" ]; then out WARN kernel "$(grep -c . <<<"$other") kernel messages worth a look: $(head -n 2 <<<"$other" | tr '\n' ';')"
+else out PASS kernel "no eMMC errors, lockups or crashes in the kernel log"; fi
+st=$(systemctl is-system-running 2>/dev/null)
+if [ "$st" = running ]; then out PASS system "all services started"
+else out WARN system "${st:-unknown}; failed: $(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"; fi
+nic=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
+if [ -n "$nic" ]; then out PASS network "online via $nic (MAC $(cat "/sys/class/net/$nic/address"))"
+else out WARN network "no default route"; fi
+getent hosts deb.debian.org >/dev/null && out PASS dns "name lookups work" || out WARN dns "can't resolve deb.debian.org"
+if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; then out PASS time "clock synced ($(timedatectl show -p Timezone --value))"
+else out WARN time "clock not synced yet"; fi
+wd=$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null)
+if [ -e /dev/watchdog0 ] && [ -n "$wd" ] && [ "$wd" != 0 ] && [ "$wd" != infinity ]; then out PASS watchdog "hardware watchdog armed ($wd)"
+else out WARN watchdog "hardware watchdog not armed"; fi
+systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null && out PASS updates "automatic security updates on" || out WARN updates "automatic updates are off"
+out INFO ssh "$(sshd -T 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication) ' | tr '\n' ' ')"
+out INFO running "$(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{sub(/\.service$/, "", $1); print $1}' | tr '\n' ' ')"
+out INFO listening "$(ss -Htulpn 2>/dev/null | awk '{p = $NF; if (match(p, /"[^"]+"/)) p = substr(p, RSTART + 1, RLENGTH - 2); else p = "?"; print $1 " " $5 " " p}' | sort -u | tr '\n' ';' | sed 's/;/; /g')"
+out INFO connections "$(ss -Htnp state established 2>/dev/null | awk '{p = $NF; if (match(p, /"[^"]+"/)) p = substr(p, RSTART + 1, RLENGTH - 2); print p " <-> " $(NF - 1)}' | sort -u | tr '\n' ';' | sed 's/;/; /g')"
+sd=
+for d in /sys/block/mmcblk[0-9]; do [ "$(cat "$d/device/type" 2>/dev/null)" = SD ] && sd=/dev/${d##*/}; done
+out INFO sdcard "${sd:-no SD card in the box}"
+exit 0
+EOF
+
+run_checks() { # alias expected-root-label
+	step "Health checks ($1)"
+	[ "$DRY" = 1 ] && { say "  [dry-run] run the health checks on the box over SSH"; return 0; }
+	ensure_ip "$1"
+	need_boxpw "$1"
+	local out f fails=0 s k m
+	out=$(broot "$1" "$CHECK_SCRIPT" "$2") || die "couldn't run the checks on the box"
+	f=$ST/check-$1-$(date +%Y%m%d-%H%M%S).txt
+	printf '%s\n' "$out" > "$f"
+	while IFS='|' read -r s k m; do
+		case $s in PASS) ok "$k: $m" ;; WARN) warn "$k: $m" ;; FAIL) bad "$k: $m"; fails=$((fails + 1)) ;; INFO) info "$k: $m" ;; esac
+	done <<<"$out"
+	say "  saved: ${f#"$W"/}"
+	if [ $fails -gt 0 ]; then
+		[ "$FORCE" = 1 ] && { warn "going on despite $fails failed check(s) (--force)"; return 0; }
+		die "$fails check(s) failed - stopping before anything is written to the eMMC. Rerun with --force to go on anyway."
+	fi
+}
+phase_check() { run_checks sd t95-root; }
+
+# =================================================================== backup
+read -r -d '' EXTCSD_SCRIPT <<'EOF'
+# read EXT_CSD
+dev=$1
+c=$(basename "$(readlink -f "/sys/block/${dev#/dev/}/device")"); h=${c%%:*}
+mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+cat "/sys/kernel/debug/$h/$c/ext_csd" 2>/dev/null
+EOF
+read -r -d '' DUMP_SCRIPT <<'EOF'
+# stream a device, compressed; its sha256 is left in /run/t95-setup.sha256
+set -o pipefail
+dev=$1 F=/run/t95-setup.fifo H=/run/t95-setup.sha256
+rm -f "$F" "$H"; mkfifo "$F"
+sha256sum < "$F" > "$H" &
+dd if="$dev" bs=4M status=progress | tee "$F" | zstd -1 -T0 -q -c
+rc=$?; wait; rm -f "$F"; exit $rc
+EOF
+
+# dump_part ALIAS DEVICE NAME DIR: DIR/NAME.img.zst, checked end to end:
+# the box hashes what it read, this PC hashes what it decompresses
+dump_part() {
+	local hf=$4/.$3.fifo hp rc boxh pch
+	rm -f "$hf"; mkfifo "$hf"
+	(zstd -dc < "$hf" | sha256sum | cut -c1-64 > "$4/.$3.pc") & hp=$!
+	broot "$1" "$DUMP_SCRIPT" "$2" | tee "$hf" > "$4/$3.img.zst"; rc=${PIPESTATUS[0]}
+	wait $hp; rm -f "$hf"
+	[ "$rc" = 0 ] || return 1
+	boxh=$(bsudo "$1" "cat /run/t95-setup.sha256; rm -f /run/t95-setup.sha256" | cut -c1-64)
+	pch=$(cat "$4/.$3.pc"); rm -f "$4/.$3.pc"
+	[ -n "$boxh" ] && [ "$boxh" = "$pch" ] || return 1
+	printf '%s  %s.img\n' "$pch" "$3" > "$4/$3.sha256"
+}
+
+phase_backup() {
+	step "Backing up the eMMC (Android as shipped)"
+	if [ "$DRY" = 1 ]; then say "  [dry-run] stream the eMMC + its boot partitions to backup/, verify the hashes"; return 0; fi
+	ensure_ip sd
+	[ "$(remote_label sd)" = t95-root ] || die "the box isn't running from the SD card"
+	local emmc dir free part name pc bpe
+	emmc=$(remote_emmc sd); [ -n "$emmc" ] || die "no eMMC found on the box"
+	dir=$W/backup/emmc-$(date +%Y%m%d-%H%M); mkdir -p "$dir"
+	free=$(df -B1 --output=avail "$dir" | tail -n 1)
+	[ "$free" -gt $((12 * 1024 * 1024 * 1024)) ] || ask_yes "Only $((free / 1024 / 1024 / 1024)) GB free here; the backup is usually 2-8 GB compressed. Try anyway?" || die "stopped"
+	need_boxpw sd
+	broot sd "$EXTCSD_SCRIPT" "$emmc" > "$dir/ext_csd.txt"
+	pc=$(cut -c359-360 "$dir/ext_csd.txt" 2>/dev/null)
+	if [[ $pc =~ ^[0-9a-fA-F]{2}$ ]]; then
+		bpe=$(( (0x$pc >> 3) & 7 )); state_set boot_part_enable "$bpe"
+		case $bpe in
+		1 | 2) warn "the eMMC is set to boot from its boot partition $bpe; the install switches that off" ;;
+		*) ok "the eMMC boots from its main area (boot partitions aren't used for booting)" ;;
+		esac
+	else warn "couldn't read the eMMC's EXT_CSD (boot partition setting unknown)"; fi
+	say "  about 15 minutes for 32 GB (eMMC reads at ~40 MB/s)"
+	for part in "" boot0 boot1; do
+		name=${part:-emmc}
+		[ -n "$part" ] && ! bssh sd "test -b $emmc$part" && continue
+		say "  $name ($emmc$part)"
+		dump_part sd "$emmc$part" "$name" "$dir" || die "backup of $name failed or didn't verify (the box was not changed)"
+		ok "$name.img.zst  sha256 $(cut -c1-16 "$dir/$name.sha256")..."
+		zstd -tq "$dir/$name.img.zst" || die "$name.img.zst is damaged"
+	done
+	cat > "$dir/RESTORE.txt" <<-EOF
+	eMMC backup of the T95 as shipped (Android + vendor firmware + the malware),
+	taken $(date) from Debian running on the SD card. It holds your box's
+	identifiers: keep it private.
+
+	To put it back: boot the box from the SD card, then on the PC run
+	    ./t95-setup restore ${dir#"$W"/}
+	Manually (booted from SD; eMMC was $emmc):
+	    zstd -dc emmc.img.zst  | sudo dd of=$emmc bs=4M conv=fsync
+	    echo 0 | sudo tee /sys/block/${emmc#/dev/}boot0/force_ro    (same for boot1)
+	    zstd -dc boot0.img.zst | sudo dd of=${emmc}boot0 conv=fsync
+	Check: sha256sum -c of the .sha256 files against the decompressed images.
+	EOF
+	state_set backup "$dir"
+	ok "backup in ${dir#"$W"/}"
+}
+
+# ================================================================== install
+read -r -d '' INSTALL_SCRIPT <<'EOF'
+# install to eMMC
+set -uo pipefail
+bpe=${1:-0}
+t95-install-emmc --yes || { echo "t95-install-emmc failed"; exit 1; }
+emmc=
+for d in /sys/block/mmcblk[0-9]; do [ "$(cat "$d/device/type" 2>/dev/null)" = MMC ] && emmc=/dev/${d##*/}; done
+[ -n "$emmc" ] || { echo "no eMMC"; exit 1; }
+echo "== blanking the eMMC boot partitions (unused leftovers of the vendor firmware)"
+for b in boot0 boot1; do
+	p=$emmc$b; [ -b "$p" ] || continue
+	ro=/sys/block/${p#/dev/}/force_ro
+	echo 0 > "$ro" 2>/dev/null
+	if dd if=/dev/zero of="$p" bs=128K count=$(( $(blockdev --getsize64 "$p") / 131072 )) conv=fsync status=none 2>/dev/null
+	then echo "   $p blanked"; else echo "   $p is write-protected, left as is"; fi
+	echo 1 > "$ro" 2>/dev/null
+done
+case $bpe in 1 | 2)
+	echo "== switching off boot-from-boot-partition"
+	command -v mmc >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q mmc-utils >/dev/null
+	mmc bootpart enable 0 0 "$emmc" || { echo "could not switch it off"; exit 1; } ;;
+esac
+echo "== giving the eMMC system its SSH host keys"
+m=$(mktemp -d)
+mount "${emmc}p1" "$m" || exit 1
+install -o root -g root -m 600 /tmp/t95hk/etc/ssh/ssh_host_*_key "$m/etc/ssh/" &&
+install -o root -g root -m 644 /tmp/t95hk/etc/ssh/ssh_host_*_key.pub "$m/etc/ssh/"
+rc=$?
+umount "$m"; rmdir "$m"; rm -rf /tmp/t95hk; sync
+[ $rc = 0 ] && echo "INSTALL OK"
+exit $rc
+EOF
+
+phase_install() {
+	step "Installing Debian on the eMMC"
+	local bk; bk=$(state_get backup)
+	if [ -z "$bk" ] || [ ! -f "$bk/emmc.sha256" ]; then
+		if [ "$DRY" = 1 ]; then say "  [dry-run] (a verified backup is required first)"
+		else [ "$FORCE" = 1 ] || die "no verified backup yet - run: ./t95-setup backup (or --force to install without one)"
+			warn "no backup (--force)"; fi
+	fi
+	ensure_ip sd
+	[ "$DRY" = 1 ] || [ "$(remote_label sd)" = t95-root ] || die "the box isn't running from the SD card"
+	ask_yes "This ERASES the box's eMMC - Android, the vendor firmware, the malware - and installs Debian there. Backup: ${bk:+${bk#"$W"/}}${bk:-none}" wipe ||
+		die "stopped - nothing was erased"
+	if [ "$DRY" = 1 ]; then say "  [dry-run] upload the t95-emmc host keys, run t95-install-emmc --yes, blank boot0/boot1, power off"
+	else
+		tar -C "$ST/hostkeys/emmc" -cf - etc/ssh | bssh_in sd 'umask 077; rm -rf /tmp/t95hk; mkdir /tmp/t95hk && tar -C /tmp/t95hk -xf -' ||
+			die "couldn't copy the eMMC host keys to the box"
+		broot sd "$INSTALL_SCRIPT" "$(state_get boot_part_enable)" || die "the install failed (the SD card still boots; the output above says where)"
+		ok "Debian is on the eMMC"
+		bsudo sd "systemctl poweroff" >/dev/null 2>&1
+		ssh_close
+		wait_gone sd || warn "the box still answers; give it a moment"
+	fi
+	state_set done_install 1
+	pause "Unplug the box's power, take the SD card out (keep it: it's your recovery disk), then plug the power back in."
+}
+
+# =================================================================== verify
+phase_verify() {
+	step "Booting from the eMMC"
+	while :; do
+		find_box emmc sd || die "the box didn't show up within 15 minutes. Check power and network, then run ./t95-setup verify (or --host IP)."
+		state_set ip "$FOUND_IP"
+		[ "$FOUND_AS" = emmc ] && break
+		warn "it booted from the SD card again - the card is still in"
+		[ "$DRY" = 1 ] || { bsudo sd "systemctl poweroff" >/dev/null 2>&1; ssh_close; wait_gone sd; }
+		pause "Unplug the box's power, take the SD card out, plug the power back in."
+	done
+	ok "the box is at $FOUND_IP, running its eMMC install"
+	run_checks emmc t95-emmc
+	summary
+}
+summary() {
+	local ip mac; ip=$(state_get ip)
+	# shellcheck disable=SC2016
+	[ "$DRY" = 1 ] || mac=$(bssh emmc 'cat /sys/class/net/$(ip -o route show default | awk "{print \$5; exit}")/address' 2>/dev/null)
+	step "Done"
+	say "  The box runs Debian from its eMMC; Android and the malware are gone."
+	say "  Keep the SD card: with it inserted, the box boots the recovery system."
+	[ -n "${mac:-}" ] && say "  Router: reserve $ip for MAC $mac so the address stays put."
+	say "  For 'ssh t95', add this to ~/.ssh/config:"
+	say ""
+	say "    Host t95"
+	say "        HostName $ip"
+	say "        User $BOXUSER"
+	say "        HostKeyAlias t95-emmc"
+	say "        UserKnownHostsFile ~/.ssh/known_hosts $ST/known_hosts"
+	say ""
+}
+
+# ================================================================== restore
+restore_stream() { # file device: decompress into the box's device
+	local fifo=/tmp/t95-restore.$$ wp rc1 rc2 ro=
+	[[ $2 == *boot[01] ]] && ro=/sys/block/${2#/dev/}/force_ro
+	bssh sd "rm -f $fifo; mkfifo -m 600 $fifo" || return 1
+	(printf '%s\n' "$BOXPW" | bssh_in sd "sudo -S -p '' sh -c '${ro:+echo 0 > $ro; }dd if=$fifo of=$2 bs=4M conv=fsync status=progress; rc=\$?; ${ro:+echo 1 > $ro; }exit \$rc'") & wp=$!
+	zstd -dc "$1" | bssh_in sd "cat > $fifo"; rc1=$?
+	wait $wp; rc2=$?
+	bssh sd "rm -f $fifo"
+	[ "$rc1" = 0 ] && [ "$rc2" = 0 ]
+}
+cmd_restore() {
+	local dir=${1:-$(state_get backup)} emmc name dev want got
+	[ -n "$dir" ] && [ -f "$dir/emmc.img.zst" ] || die "no backup found (give the directory: ./t95-setup restore backup/emmc-...)"
+	step "Restoring the eMMC from ${dir#"$W"/}"
+	[ "$DRY" = 1 ] && { say "  [dry-run] stream the images back to the eMMC and verify them"; return 0; }
+	ensure_ip sd
+	[ "$(remote_label sd)" = t95-root ] || die "boot the box from the SD card first"
+	emmc=$(remote_emmc sd); [ -n "$emmc" ] || die "no eMMC found"
+	ask_yes "This overwrites the eMMC with the backup: Android as shipped, malware included." restore || die "stopped"
+	need_boxpw sd
+	for name in emmc boot0 boot1; do
+		[ -f "$dir/$name.img.zst" ] || continue
+		dev=$emmc; [ $name = emmc ] || dev=$emmc$name
+		say "  $name -> $dev"
+		restore_stream "$dir/$name.img.zst" "$dev" || die "writing $name failed"
+		want=$(cut -c1-64 "$dir/$name.sha256")
+		got=$(bsudo sd "sha256sum $dev" | cut -c1-64)
+		[ "$want" = "$got" ] && ok "$name restored and verified" || die "$name doesn't verify after writing"
+	done
+	ok "Android is back. Power off, remove the SD card, power on."
+}
+
+# ===================================================================== main
+cmd_status() {
+	local p
+	for p in "${PHASES[@]}"; do if done_p "$p"; then say "  done     $p"; else say "  -        $p"; fi; done
+	say "  box IP:  $(state_get ip)"
+	say "  backup:  $(state_get backup)"
+}
+usage() { sed -n '2,/^# shellcheck/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+
+main() {
+	local steps=() s
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--dry-run) DRY=1 ;;
+		--force) FORCE=1 ;;
+		--host) HOST_OPT=${2:?--host needs an IP}; shift ;;
+		--adb) ADB_TARGET=${2:?--adb needs a serial or IP}; shift ;;
+		-h | --help) usage; exit 0 ;;
+		-*) die "unknown option $1 (see --help)" ;;
+		*) steps+=("$1") ;;
+		esac
+		shift
+	done
+	[ "$(id -u)" != 0 ] || die "run this as your normal user; it asks for sudo when it needs it"
+	[ -f "$W/board/build-rootfs.sh" ] || die "run this from the t95-tvbox repo"
+	case ${steps[0]:-} in
+	status) cmd_status; exit 0 ;;
+	reset) ask_yes "Forget progress? (keys, password, backups and builds stay)" && rm -f "$ST/state" && say "progress cleared"; exit 0 ;;
+	esac
+
+	mkdir -p "$ST" "$CTL" "$W/logs"; chmod 700 "$ST" "$CTL"
+	exec 9>"$ST/lock"; flock -n 9 || die "another t95-setup is running"
+	[ -e /dev/tty ] || die "needs an interactive terminal"
+	local log; log=$W/logs/t95-setup-$(date +%Y%m%d-%H%M%S).log
+	exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$log")) 2>&1
+	trap 'ssh_close; sleep 0.2' EXIT
+	trap 'echo; die "stopped. Run ./t95-setup again to carry on from here."' INT TERM
+	[ "$DRY" = 1 ] && say "${B}dry run: nothing is changed${N}"
+
+	if [ "${steps[0]:-}" = restore ]; then cmd_restore "${steps[1]:-}"; exit 0; fi
+	if [ ${#steps[@]} = 0 ]; then
+		for s in "${PHASES[@]}"; do
+			if done_p "$s"; then say "  (done: $s)"; continue; fi
+			"phase_$s"; state_set "done_$s" 1
+		done
+	else
+		for s in "${steps[@]}"; do
+			declare -F "phase_$s" >/dev/null || die "unknown step '$s' (steps: ${PHASES[*]})"
+			"phase_$s"; state_set "done_$s" 1
+		done
+	fi
+	say ""
+	say "log: ${log#"$W"/}"
+}
+
+[ "${BASH_SOURCE[0]}" = "$0" ] && main "$@"

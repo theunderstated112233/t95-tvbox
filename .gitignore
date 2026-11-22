@@ -2,6 +2,8 @@
 # device's identifiers), vendor blobs, logs (contain LAN addresses), local notes
 keys/
 backup/
+# t95-setup: password hash, the box's SSH host keys, reports
+.t95-setup/
 logs/
 *.log
 *.html

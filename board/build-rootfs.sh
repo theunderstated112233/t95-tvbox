@@ -10,6 +10,13 @@ OUT=$W/out
 # password), password expired so the first login must set a new one.
 USERNAME=${T95_USER:-t95}
 PASSWORD=${T95_PASSWORD:-$USERNAME}
+# optional: a file holding a crypt(3) hash for the account (openssl passwd -6),
+# used instead of T95_PASSWORD - keeps the plaintext out of the build and is
+# safe for passwords with quotes, $ or backslashes
+PWHASHFILE=${T95_PASSWORD_HASHFILE:-}
+# 1 (default): the password must be changed at first login (the default one is
+# public). 0: keep it - for a password you chose yourself (used by t95-setup)
+EXPIRE=${T95_EXPIRE_PASSWORD:-1}
 # optional: preinstall an SSH public key for that account (none by default)
 PUBKEY=${T95_PUBKEY:-}
 # locale your SSH client forwards (sshd AcceptEnv LANG LC_*); system default is C.UTF-8
@@ -25,10 +32,15 @@ DRV_VER=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' "$DRV/dkms.conf")
 [ -f "$DTB" ] || "$W/board/build-dtb.sh"
 [ -f "$UBOOT" ] || { echo "missing $UBOOT - run board/build-uboot.sh"; exit 1; }
 [ -z "$PUBKEY" ] || [ -f "$PUBKEY" ] || { echo "missing SSH public key $PUBKEY"; exit 1; }
+[ -z "$PWHASHFILE" ] || [ -f "$PWHASHFILE" ] || { echo "missing password hash file $PWHASHFILE"; exit 1; }
+case $EXPIRE in 0|1) ;; *) echo "T95_EXPIRE_PASSWORD must be 0 or 1"; exit 1 ;; esac
 KEYHOOKS=()
 [ -z "$PUBKEY" ] || KEYHOOKS=(
 	--customize-hook="mkdir -p \"\$1/home/$USERNAME/.ssh\""
 	--customize-hook="upload '$PUBKEY' /home/$USERNAME/.ssh/authorized_keys"
+)
+[ -z "$PWHASHFILE" ] || KEYHOOKS+=(
+	--customize-hook="upload '$PWHASHFILE' /root/.t95-pwhash"
 )
 
 # Host (Mint) keyring is too old for trixie; use Debian 2025.1 keyring extracted
@@ -77,8 +89,13 @@ mmdebstrap \
 		echo t95 > /etc/hostname
 		printf \"127.0.0.1\tlocalhost\n127.0.1.1\tt95\n::1\tlocalhost ip6-localhost ip6-loopback\n\" > /etc/hosts
 		useradd -m -s /bin/bash -G sudo,adm,systemd-journal $USERNAME
-		echo \"$USERNAME:$PASSWORD\" | chpasswd
-		passwd -e $USERNAME
+		if [ -f /root/.t95-pwhash ]; then
+			{ printf %s $USERNAME:; cat /root/.t95-pwhash; } | chpasswd -e
+			rm -f /root/.t95-pwhash
+		else
+			echo \"$USERNAME:$PASSWORD\" | chpasswd
+		fi
+		[ $EXPIRE = 0 ] || passwd -e $USERNAME
 		passwd -l root
 		chown $USERNAME:$USERNAME /home/$USERNAME
 		if [ -f /home/$USERNAME/.ssh/authorized_keys ]; then

@@ -92,6 +92,29 @@ Boot ROM ──(SD first, then eMMC; checks TOC0 signature against the empty fus
 * Optional: a **3.3 V USB-UART adapter** on the board's serial pads, to watch
   the boot and read the first-boot SSH host key fingerprints.
 
+## Guided install: `t95-setup`
+
+`./t95-setup` does everything below for you and stops only when it needs your
+hands (SD card, cables, power) or your OK (anything that erases). Run it from
+the repo as your normal user; run it again after any interruption and it
+carries on where it stopped (`./t95-setup status` shows where that is).
+
+| Step | What happens | Needs you |
+|---|---|---|
+| `prep` | installs the build packages, clones the pinned sources, fetches the Debian 13 signing keys and checks their fingerprints | sudo password |
+| `doctor` | read-only check from Android over adb: H616, empty key fuse, AXP1530, BCM43342, 4 GB, eMMC, and the factory DRAM settings vs. the defconfig | ADB on (or `skip`) |
+| `build` | everything in [Building](#building), with your SSH key, your password (stored only as a hash) and your PC's timezone | choose a password |
+| `card` | finds the SD card, writes it, reads it back to verify | confirm the card by typing its name (e.g. `sdb`) |
+| `boot` | finds the box on your network by its SSH host key (no serial console needed) | insert card, cable, power |
+| `check` | RAM, cpufreq, thermal map, eMMC speed mode and read test, kernel log, watchdog, updates; lists running services, open ports, connections | - |
+| `backup` | full eMMC + boot partitions to `backup/`, hashed on the box and on the PC | - |
+| `install` | `t95-install-emmc`, blanks the leftover eMMC boot partitions | type `wipe`; then power off, remove card, power on |
+| `verify` | checks it now runs from the eMMC and repeats the health checks | - |
+
+`--dry-run` shows what it would do, `--host IP` skips the network scan,
+`./t95-setup restore` puts the backed-up Android back. Private files (password
+hash, the box's SSH host keys, reports) live in `.t95-setup/`, git-ignored.
+
 ## Building
 
 Everything builds as a normal user on an x86-64 Linux PC (tested on Linux Mint
@@ -187,6 +210,7 @@ around 40 °C.
 
 | Path | What |
 |---|---|
+| `t95-setup` | guided install: runs every step below, stops only for cables, power, the SD card and confirmations |
 | `board/sun50i-h616-t95.dts` | board device tree (used by both U-Boot and Linux) |
 | `board/t95_h616_defconfig` | U-Boot config: DRAM, PMIC, TOC0 |
 | `board/patches/u-boot/` | 4 GiB detection fix for TOC0 boot |
