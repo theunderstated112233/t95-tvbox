@@ -109,6 +109,10 @@ mmdebstrap \
 		dkms install leds-fd6551/$DRV_VER -k \$(ls /lib/modules | head -n1)
 		# no baked-in SSH host keys: each install makes its own on first boot
 		rm -f /etc/ssh/ssh_host_*
+		# no battery-backed clock: systemd starts the clock at least at this
+		# file's date, so a fresh install boots with the build date, not
+		# systemd's own (months older), until the first time sync
+		touch /usr/lib/clock-epoch
 	'" \
 	--customize-hook='cat > "$1/etc/apt/sources.list" <<EOF
 deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian trixie main non-free-firmware
