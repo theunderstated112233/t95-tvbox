@@ -122,7 +122,7 @@ scripts in [Building](#building).
 
 ## Building
 
-Everything builds as a normal user on an x86-64 Linux PC (tested on Linux Mint
+You can run the interactive setup script and follow it or build. Everything builds as a normal user on an x86-64 Linux PC (tested on Linux Mint
 22.3); only writing a card needs root. The rootfs is built for arm64 under
 qemu-user emulation, so allow about 30 minutes and 10 GB of disk.
 
